@@ -195,19 +195,33 @@ class Client(Entity):
                 )
             )
 
-        # ecp.RelayState among headers
+        # ecp.RelayState and paos.Request among headers, regardless of order
         _relay_state = None
         _paos_request = None
         for item in respdict["header"]:
             if item.c_tag == "RelayState" and item.c_namespace == ecp.NAMESPACE:
+                if _relay_state is not None:
+                    raise BadRequest("Multiple RelayState headers")
                 _relay_state = item
             if item.c_tag == "Request" and item.c_namespace == paos.NAMESPACE:
+                if _paos_request is not None:
+                    raise BadRequest("Multiple PAOS Request headers")
                 _paos_request = item
 
         if _paos_request is None:
             raise BadRequest("Missing request")
 
         _rc_url = _paos_request.response_consumer_url
+
+        # The return target in the PAOS header must point back to the same
+        # endpoint as the AuthnRequest, otherwise the assertion could be
+        # delivered to the wrong address.
+        _acs_url = authn_request.assertion_consumer_service_url
+        if _acs_url is not None and _rc_url != _acs_url:
+            raise BadRequest(
+                "response_consumer_url does not match the AuthnRequest "
+                "assertion_consumer_service_url"
+            )
 
         return {
             "authn_request": authn_request,

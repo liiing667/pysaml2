@@ -1,5 +1,6 @@
 from contextlib import closing
 
+import pytest
 from pathutils import dotname
 from pathutils import full_path
 
@@ -17,6 +18,7 @@ from saml2.samlp import STATUS_SUCCESS
 from saml2.samlp import AuthnRequest
 from saml2.samlp import Response
 from saml2.server import Server
+from saml2.s_utils import BadRequest
 
 
 __author__ = "rolandh"
@@ -146,3 +148,57 @@ def test_complete_flow():
 
         assert resp.response.destination == "http://lingon.catalogix.se:8087/paos"
         assert resp.response.status.status_code.value == STATUS_SUCCESS
+
+
+def _sp_ecp_respdict(client, sp, idp_entity_id):
+    sid, message = sp.create_ecp_authn_request(idp_entity_id, relay_state="XYZ")
+    return client.parse_soap_message(message)
+
+
+def test_parse_sp_ecp_response_duplicate_relay_state():
+    client = ecp_client.Client("user", "password", metadata_file=full_path("idp_all.xml"))
+    sp = Saml2Client(config_file=dotname("servera_conf"))
+
+    with closing(Server(config_file=dotname("idp_all_conf"))) as idp:
+        respdict = _sp_ecp_respdict(client, sp, idp.config.entityid)
+
+    # a second ecp:RelayState header block must not be accepted
+    respdict["header"].append(
+        RelayState(actor="http://schemas.xmlsoap.org/soap/actor/next", must_understand="1", text="ABC")
+    )
+
+    with pytest.raises(BadRequest):
+        client.parse_sp_ecp_response(respdict)
+
+
+def test_parse_sp_ecp_response_mismatched_consumer_url():
+    client = ecp_client.Client("user", "password", metadata_file=full_path("idp_all.xml"))
+    sp = Saml2Client(config_file=dotname("servera_conf"))
+
+    with closing(Server(config_file=dotname("idp_all_conf"))) as idp:
+        respdict = _sp_ecp_respdict(client, sp, idp.config.entityid)
+
+    # the paos:Request return target points somewhere else than the
+    # AuthnRequest assertion consumer service URL
+    for item in respdict["header"]:
+        if isinstance(item, Request):
+            item.response_consumer_url = "https://evil.example.com/acs"
+
+    with pytest.raises(BadRequest):
+        client.parse_sp_ecp_response(respdict)
+
+
+def test_parse_sp_ecp_response_no_relay_state():
+    client = ecp_client.Client("user", "password", metadata_file=full_path("idp_all.xml"))
+    sp = Saml2Client(config_file=dotname("servera_conf"))
+
+    with closing(Server(config_file=dotname("idp_all_conf"))) as idp:
+        respdict = _sp_ecp_respdict(client, sp, idp.config.entityid)
+
+    # legacy flow without an ecp:RelayState header block is still fine
+    respdict["header"] = [item for item in respdict["header"] if not isinstance(item, RelayState)]
+
+    cargs = client.parse_sp_ecp_response(respdict)
+
+    assert cargs["relay_state"] is None
+    assert cargs["rc_url"] == respdict["body"].assertion_consumer_service_url
