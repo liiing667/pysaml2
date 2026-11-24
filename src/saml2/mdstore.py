@@ -240,6 +240,68 @@ def repack_cert(cert):
         return "\n".join([s.strip() for s in part])
 
 
+def _snapshot_valid_until(metadata):
+    """
+    Return the validUntil of the snapshot held by a metadata source.
+
+    :param metadata: A metadata source (e.g. InMemoryMetaData instance)
+    :return: A time tuple (as returned by saml2.time_util.str_to_time)
+        or None when the snapshot carries no usable validity information.
+    """
+    for descr in [getattr(metadata, "entities_descr", None), getattr(metadata, "entity_descr", None)]:
+        valid_until = getattr(descr, "valid_until", None)
+        if valid_until:
+            try:
+                return str_to_time(valid_until)
+            except Exception:
+                logger.warning("Could not parse validUntil: %s", valid_until)
+                return None
+    return None
+
+
+def _same_snapshot_content(current, new):
+    """
+    Whether two snapshots carry the same content.
+
+    The comparison is done on the parsed representation, so differences
+    in whitespace or attribute order are irrelevant.
+    """
+    try:
+        return current == new
+    except Exception:
+        return False
+
+
+def _is_downgrade(current, new):
+    """
+    Whether the new snapshot is older than the currently published one.
+
+    A snapshot is only known to be older when both carry validUntil
+    information and the new one expires earlier.
+    """
+    current_valid_until = _snapshot_valid_until(current)
+    new_valid_until = _snapshot_valid_until(new)
+    if current_valid_until is not None and new_valid_until is not None:
+        return new_valid_until < current_valid_until
+    return False
+
+
+def _accept_snapshot(current, new):
+    """
+    Decide whether a new snapshot may replace the currently published one.
+
+    Published snapshots only move forward:
+    - identical content (ignoring whitespace and attribute order) is the
+      same generation; the published data is kept as is
+    - an older snapshot (a downgrade replay) is rejected
+    """
+    if _same_snapshot_content(current, new):
+        return False
+    if _is_downgrade(current, new):
+        return False
+    return True
+
+
 class MetaData:
     def __init__(self, attrc, metadata="", node_name=None, check_validity=True, security=None, **kwargs):
         self.attrc = attrc
@@ -979,14 +1041,51 @@ class MetaDataMDX(InMemoryMetaData):
     def _is_metadata_fresh(self, item):
         return before(self.expiration_date[item])
 
+    @staticmethod
+    def _entity_valid_until(entity):
+        valid_until = (entity or {}).get("valid_until")
+        if valid_until:
+            try:
+                return str_to_time(valid_until)
+            except Exception:
+                logger.warning("Could not parse validUntil: %s", valid_until)
+        return None
+
+    def _refresh_metadata(self, item):
+        """
+        Refresh an expired entry.
+
+        A failed refresh or an older (replayed) snapshot must not change
+        what consumers see: the previously published data is kept.
+        """
+        cached_entity = self.entity[item]
+        cached_expiration = self.expiration_date[item]
+        del self.entity[item]
+        try:
+            entity = self._fetch_metadata(item)
+        except Exception as e:
+            logger.warning("Refreshing metadata for %s failed (%s); keeping the published data", item, e)
+            self.entity[item] = cached_entity
+            self.expiration_date[item] = cached_expiration
+            return cached_entity
+
+        cached_valid_until = self._entity_valid_until(cached_entity)
+        new_valid_until = self._entity_valid_until(entity)
+        if cached_valid_until is not None and new_valid_until is not None and new_valid_until < cached_valid_until:
+            logger.warning("Fetched metadata for %s is older than the published data; ignoring it", item)
+            self.entity[item] = cached_entity
+            self.expiration_date[item] = cached_expiration
+            return cached_entity
+
+        return entity
+
     def __getitem__(self, item):
         if item not in self.entity:
             entity = self._fetch_metadata(item)
         elif not self._is_metadata_fresh(item):
             msg = f"Metadata for {item} have expired; refreshing metadata"
             logger.info(msg)
-            _ = self.entity.pop(item)
-            entity = self._fetch_metadata(item)
+            entity = self._refresh_metadata(item)
         else:
             entity = self.entity[item]
         return entity
@@ -1024,16 +1123,43 @@ class MetadataStore(MetaData):
         self.security = security_context(config)
         self.ii = 0
         self.metadata = {}
+        self.generation = 0
         self.check_validity = check_validity
         self.filter = filter
         self.to_old = {}
         self.http_client_timeout = http_client_timeout
 
-    def load(self, *args, **kwargs):
+    def _publish(self, key, md, container=None):
+        """
+        Publish a loaded metadata source under a key.
+
+        Published snapshots only move forward: a snapshot that is older
+        than the published one (a downgrade replay) or that carries the
+        same content never replaces what consumers see.
+
+        :param key: The source identifier
+        :param md: The newly loaded metadata source
+        :param container: The mapping to publish into (defaults to the
+            live store)
+        :return: The published metadata source for the key
+        """
+        container = self.metadata if container is None else container
+        current = container.get(key)
+        if current is not None and not _accept_snapshot(current, md):
+            logger.warning("Metadata source %s: ignoring stale or identical snapshot", key)
+            return current
+        container[key] = md
+        if container is self.metadata:
+            self.generation += 1
+        return md
+
+    def load(self, *args, _target=None, **kwargs):
         if self.filter:
             _args = {"filter": self.filter}
         else:
             _args = {}
+
+        target = self.metadata if _target is None else _target
 
         typ = args[0]
         if typ == "local":
@@ -1045,7 +1171,7 @@ class MetadataStore(MetaData):
                     _fil = join(key, fil)
                     _md = MetaDataFile(self.attrc, _fil, **_args)
                     _md.load()
-                    self.metadata[_fil] = _md
+                    self._publish(_fil, _md, target)
                 return
             else:
                 # else it's just a plain old file so read it
@@ -1098,21 +1224,44 @@ class MetadataStore(MetaData):
         else:
             raise SAMLError(f"Unknown metadata type '{typ}'")
         _md.load()
-        self.metadata[key] = _md
+        self._publish(key, _md, target)
 
     def reload(self, spec):
-        # Save the old set of metadata
+        """
+        Reload the metadata, publishing a single complete generation.
+
+        The new generation is built privately; consumers keep seeing the
+        current generation until the new one is complete. A failed reload
+        leaves the published data untouched, and for each source the
+        published snapshot only moves forward: older (replayed) snapshots
+        and unchanged content never replace what consumers see.
+        """
         old_metadata = self.metadata
-        self.metadata = {}
+        new_metadata = {}
         try:
             # Reload the metadata based on the spec
-            self.imp(spec)
+            self.imp(spec, _target=new_metadata)
         except Exception as e:
-            # Something went wrong, restore the previous metadata
-            self.metadata = old_metadata
+            # Something went wrong, the published generation is untouched
             raise e
 
-    def imp(self, spec):
+        # Only move forward: keep the published snapshot for sources
+        # whose refresh is a downgrade replay or carries the same content
+        merged = dict(new_metadata)
+        for key, current in old_metadata.items():
+            new = new_metadata.get(key)
+            if new is None:
+                continue
+            if not _accept_snapshot(current, new):
+                merged[key] = current
+
+        # Atomically publish the unique complete new generation
+        self.metadata = merged
+        self.generation += 1
+
+    def imp(self, spec, _target=None):
+        target = self.metadata if _target is None else _target
+
         # This serves as a backwards compatibility
         if type(spec) is dict:
             # Old style...
@@ -1121,9 +1270,9 @@ class MetadataStore(MetaData):
                     if isinstance(val, dict):
                         if not self.check_validity:
                             val["check_validity"] = False
-                        self.load(key, **val)
+                        self.load(key, _target=target, **val)
                     else:
-                        self.load(key, val)
+                        self.load(key, val, _target=target)
         else:
             for item in spec:
                 try:
@@ -1154,7 +1303,7 @@ class MetadataStore(MetaData):
                             _fil = join(key[0], fil)
                             _md = MetaDataFile(self.attrc, _fil)
                             _md.load()
-                            self.metadata[_fil] = _md
+                            self._publish(_fil, _md, target)
                             if _md.to_old:
                                 self.to_old[_fil] = _md.to_old
                         return
@@ -1164,7 +1313,7 @@ class MetadataStore(MetaData):
 
                     _md = MDloader(self.attrc, key[0], **kwargs)
                     _md.load()
-                    self.metadata[key[0]] = _md
+                    self._publish(key[0], _md, target)
                     if _md.to_old:
                         self.to_old[key[0]] = _md.to_old
 
