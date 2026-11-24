@@ -276,9 +276,74 @@ class OpenSSLWrapper:
             valid, message = self.verify(tmp_cert_str, cert_str)
             if not valid:
                 return False, message
-            else:
-                cert_str = tmp_cert_str
-            return (True, "Signed certificate is valid and correctly signed by CA certificate.")
+            cert_str = tmp_cert_str
+        # Every link of the chain has been validated, including the root
+        # certificate: make sure the last certificate actually is a
+        # self-signed root and that it is currently valid. Without this
+        # check an expired root, or a certificate merely pretending to be a
+        # root, would be accepted as trusted.
+        valid, message = self.verify_root(cert_str)
+        if not valid:
+            return False, message
+        return True, "Signed certificate is valid and correctly signed by CA certificate."
+
+    def verify_root(self, cert_str):
+        """
+        Verifies that a certificate is a currently valid, self-signed
+        root certificate.
+
+        :param cert_str: The candidate root certificate, as a string.
+        :return: Valid, Message
+                 Valid = True if the certificate is a valid self-signed
+                 root, otherwise False.
+                 Message = Why the validation failed.
+        """
+
+        cert_str_bytes = cert_str if isinstance(cert_str, bytes) else cert_str.encode("ascii")
+
+        try:
+            cert_crypto = saml2.cryptography.pki.load_pem_x509_certificate(cert_str_bytes)
+        except ValueError as e:
+            return False, f"Failed to load root certificate: {e}"
+
+        now = datetime.now(timezone.utc)
+        if now < cert_crypto.not_valid_before_utc:
+            return False, "Root certificate is not valid yet."
+        if now >= cert_crypto.not_valid_after_utc:
+            return False, "Root certificate is expired."
+
+        if cert_crypto.issuer != cert_crypto.subject:
+            return False, "Root certificate is not self-signed."
+
+        if cert_crypto.signature_hash_algorithm is None:
+            return False, "Unsupported signature algorithm (no hash algorithm present)."
+
+        root_public_key = cert_crypto.public_key()
+
+        if isinstance(root_public_key, _rsa.RSAPublicKey):
+            try:
+                root_public_key.verify(
+                    signature=cert_crypto.signature,
+                    data=cert_crypto.tbs_certificate_bytes,
+                    padding=_padding.PKCS1v15(),
+                    algorithm=cert_crypto.signature_hash_algorithm,
+                )
+                return True, "Root certificate is a valid self-signed certificate."
+            except InvalidSignature as e:
+                return False, f"Root certificate is incorrectly self-signed: {str(e)}"
+
+        if isinstance(root_public_key, _ec.EllipticCurvePublicKey):
+            try:
+                root_public_key.verify(
+                    signature=cert_crypto.signature,
+                    data=cert_crypto.tbs_certificate_bytes,
+                    signature_algorithm=_ec.ECDSA(cert_crypto.signature_hash_algorithm),
+                )
+                return True, "Root certificate is a valid self-signed certificate."
+            except InvalidSignature as e:
+                return False, f"Root certificate is incorrectly self-signed: {str(e)}"
+
+        return False, f"Unsupported public key type: {type(root_public_key)}"
 
     def verify(self, signing_cert_str, cert_str):
         """

@@ -1,6 +1,17 @@
 # Changelog
 
 
+## Unreleased
+
+- Fix certificate chain verification so that every link from the leaf up to
+  a valid self-signed root is checked; an untrusted, non-self-signed or
+  expired root now fails the chain instead of being accepted as trusted
+- `CertHandler.verify_cert` only records a certificate after validation
+  succeeds, so a failed validation no longer overwrites the last trusted
+  certificate, and verification no longer crashes when certificate generation
+  is not configured
+
+
 ## v7.5.5 (2026-09-17)
 
 - Resolve CVE-2026-26007 by migrating to the from pyOpenSSL to the cryptography APIs

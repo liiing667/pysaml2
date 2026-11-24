@@ -1111,6 +1111,9 @@ class CertHandler:
 
             self._cert_info = None
             self._generate_cert_func_active = False
+            # Always remember the optional extension so verify_cert() keeps
+            # working even when certificate generation is not configured.
+            self._cert_handler_extra_class = cert_handler_extra_class
             if (
                 generate_cert_info is not None
                 and len(self._cert_str) > 0
@@ -1120,7 +1123,6 @@ class CertHandler:
             ):
                 self._generate_cert = True
                 self._cert_info = generate_cert_info
-                self._cert_handler_extra_class = cert_handler_extra_class
 
     def verify_cert(self, cert_file):
         if self._verify_cert:
@@ -1128,13 +1130,24 @@ class CertHandler:
                 cert_str = self._osw.read_str_from_file(cert_file, "pem")
             else:
                 return False
-            self._last_validated_cert = cert_str
             if self._cert_handler_extra_class is not None and self._cert_handler_extra_class.use_validate_cert_func():
-                self._cert_handler_extra_class.validate_cert(cert_str, self._cert_str, self._key_str)
+                valid = self._cert_handler_extra_class.validate_cert(
+                    cert_str, self._cert_str, self._key_str
+                )
+                # Be tolerant of custom handlers that only raise on failure
+                # and do not return an explicit result.
+                if valid is False:
+                    return False
             else:
                 valid, mess = self._osw.verify(self._cert_str, cert_str)
                 logger.info("CertHandler.verify_cert: %s", mess)
-                return valid
+                if not valid:
+                    return False
+            # Only remember the certificate once the whole validation has
+            # succeeded, so a failed validation can neither overwrite the
+            # last trusted certificate nor make it unavailable.
+            self._last_validated_cert = cert_str
+            self._last_cert_verified = cert_str
         return True
 
     def generate_cert(self):
