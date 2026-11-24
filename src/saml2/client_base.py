@@ -786,6 +786,7 @@ class Base(Entity):
             "entity_id": self.config.entityid,
             "attribute_converters": self.config.attribute_converters,
             "allow_unknown_attributes": self.config.allow_unknown_attributes,
+            "required_attributes": self.config.getattr("required_attributes"),
             "conv_info": conv_info,
         }
 

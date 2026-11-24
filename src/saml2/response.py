@@ -12,6 +12,7 @@ from saml2 import time_util
 from saml2 import xmldsig as ds
 from saml2 import xmlenc as xenc
 from saml2.attribute_converter import to_local
+from saml2.s_utils import MissingValue
 from saml2.s_utils import RequestVersionTooHigh
 from saml2.s_utils import RequestVersionTooLow
 from saml2.saml import SCM_BEARER
@@ -489,6 +490,7 @@ class AuthnResponse(StatusResponse):
         want_assertions_signed=False,
         want_assertions_or_response_signed=False,
         want_response_signed=False,
+        required_attributes=None,
         conv_info=None,
         **kwargs,
     ):
@@ -510,6 +512,7 @@ class AuthnResponse(StatusResponse):
         self.require_signature = want_assertions_signed
         self.require_signature_or_response_signature = want_assertions_or_response_signed
         self.require_response_signature = want_response_signed
+        self.required_attributes = list(required_attributes or [])
         self.test = test
         self.allow_unknown_attributes = allow_unknown_attributes
         #
@@ -654,6 +657,66 @@ class AuthnResponse(StatusResponse):
         self.decrypt_attributes(attr_statem)
         return to_local(self.attribute_converters, attr_statem, self.allow_unknown_attributes)
 
+    @staticmethod
+    def _merge_attribute_values(ava, values):
+        """Merge attribute values into an existing identity.
+
+        Attribute statements are additive.  Replacing an existing key would
+        discard values provided by an earlier statement for the same
+        attribute.
+        """
+        for key, vals in values.items():
+            merged = ava.setdefault(key, [])
+            for val in vals:
+                if val not in merged:
+                    merged.append(val)
+
+    def _attribute_aliases(self, name):
+        """Return local/wire aliases that identify an attribute name."""
+        name = name.strip().lower()
+        aliases = {name}
+
+        for converter in self.attribute_converters or []:
+            to_local_map = getattr(converter, "_to", None) or {}
+            from_local_map = getattr(converter, "_fro", None) or {}
+
+            if name in to_local_map:
+                wire_name = to_local_map[name].lower()
+                aliases.add(wire_name)
+                local_name = from_local_map.get(wire_name)
+                if local_name:
+                    aliases.add(local_name.strip().lower())
+
+            if name in from_local_map:
+                local_name = from_local_map[name].strip().lower()
+                aliases.add(local_name)
+                if local_name in to_local_map:
+                    aliases.add(to_local_map[local_name].lower())
+
+        return aliases
+
+    def _has_attribute(self, name, ava):
+        ava_aliases = set()
+        for ava_name in ava:
+            ava_aliases.update(self._attribute_aliases(ava_name))
+        return bool(self._attribute_aliases(name) & ava_aliases)
+
+    def verify_required_attributes(self, ava=None):
+        """Fail closed unless every required attribute is in the final identity.
+
+        The identity is built from all attribute statements first.  Missing
+        and unresolvable (unknown) required attributes are handled the same
+        way so a partial identity is never committed.
+        """
+        if not self.required_attributes:
+            return
+
+        if ava is None:
+            ava = self.ava or {}
+        missing = [name for name in self.required_attributes if not self._has_attribute(name, ava)]
+        if missing:
+            raise MissingValue(f"Required attribute missing: {', '.join(map(str, missing))}")
+
     def get_identity(self):
         """The assertion can contain zero or more attributeStatements"""
         ava = {}
@@ -668,12 +731,15 @@ class AuthnResponse(StatusResponse):
                                     n=n_attr_statements
                                 )
                                 raise ValueError(msg)
-                            ava.update(self.read_attribute_statement(tmp_assertion.attribute_statement[0]))
+                            self._merge_attribute_values(
+                                ava,
+                                self.read_attribute_statement(tmp_assertion.attribute_statement[0]),
+                            )
             if _assertion.attribute_statement:
                 logger.debug("Assertion contains %s attribute statement(s)", (len(self.assertion.attribute_statement)))
                 for _attr_statem in _assertion.attribute_statement:
                     logger.debug(f"Attribute Statement: {_attr_statem}")
-                    ava.update(self.read_attribute_statement(_attr_statem))
+                    self._merge_attribute_values(ava, self.read_attribute_statement(_attr_statem))
             if not ava:
                 logger.debug("Assertion contains no attribute statements")
         return ava
@@ -1000,8 +1066,10 @@ class AuthnResponse(StatusResponse):
             self.assertion = self.assertions[0]
 
         if self.context == "AuthnReq" or self.context == "AttrQuery":
-            self.ava = self.get_identity()
-            logger.debug(f"--- AVA: {self.ava}")
+            ava = self.get_identity()
+            logger.debug(f"--- AVA: {ava}")
+            self.verify_required_attributes(ava)
+            self.ava = ava
 
         return True
 
