@@ -131,7 +131,10 @@ class IdentMDB(IdentDB):
         return _id
 
     def store(self, ident, name_id):
-        self.mdb.store(ident, name_id=to_dict(name_id, MMODS, True))
+        name_id_doc = to_dict(name_id, MMODS, True)
+        # Registering the same NameID for the same user is idempotent.
+        if not self.mdb.get(value=ident, name_id=name_id_doc):
+            self.mdb.store(ident, name_id=name_id_doc)
 
     def find_nameid(
         self, userid, nformat=None, sp_name_qualifier=None, name_qualifier=None, sp_provided_id=None, **kwargs

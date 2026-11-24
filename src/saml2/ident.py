@@ -113,46 +113,188 @@ class IdentDB:
         """
         # One user may have more than one NameID defined
         try:
-            val = self.db[ident].split(" ")
+            stored = self.db[ident]
         except KeyError:
-            val = []
+            stored = ""
+
+        val = list(dict.fromkeys(val for val in stored.split(" ") if val)) if stored else []
 
         _cn = code(name_id)
-        val.append(_cn)
+        # Registering the same NameID more than once must not create
+        # duplicate entries in the user's list of NameIDs.
+        if _cn not in val:
+            val.append(_cn)
         self.db[ident] = " ".join(val)
-        self.db[name_id.text] = ident
+
+        # The value part of a NameID is not unique: different tenants may use
+        # the same text for completely different identities.  Keep the
+        # reverse mapping keyed by the complete NameID instead.
+        self.db[_cn] = ident
 
     def remove_remote(self, name_id):
         """
         Remove a NameID to userID mapping
 
         :param name_id: NameID instance
+        :raises KeyError: If no mapping exists for the NameID
         """
         _cn = code(name_id)
-        _id = self.db[name_id.text]
+        text = name_id.text
+
+        # Prefer the full NameID mapping.  Only fall back to the old
+        # text-only mapping if it is consistent with the forward mapping.
+        try:
+            _id = self.db[_cn]
+        except KeyError:
+            _id = None
+        else:
+            # Guard against a stale reverse mapping: the owner must really
+            # refer back to this complete NameID.
+            try:
+                owner_vals = self.db[_id].split(" ")
+            except (AttributeError, KeyError):
+                owner_vals = []
+            if _cn not in owner_vals:
+                owner = self._find_forward_owner(_cn)
+                if owner is not None:
+                    _id = owner
+
+        if _id is None:
+            _id = self._find_forward_owner(_cn)
+
+        if _id is None and text is not None:
+            try:
+                alias = self.db[text]
+            except KeyError:
+                pass
+            else:
+                if self._text_alias_matches(name_id, alias):
+                    _id = alias
+
+        if _id is None:
+            raise KeyError(name_id.text)
+
         try:
             vals = self.db[_id].split(" ")
-            vals.remove(_cn)
-            self.db[_id] = " ".join(vals)
+        except KeyError:
+            vals = None
+
+        if vals is not None and _cn in vals:
+            vals = [val for val in vals if val != _cn]
+            if vals:
+                self.db[_id] = " ".join(vals)
+            else:
+                del self.db[_id]
+
+        # Remove the complete NameID mapping, and the text alias only when it
+        # really belongs to the same user.  Otherwise removing one tenant's
+        # NameID would delete another tenant's mapping.
+        try:
+            del self.db[_cn]
         except KeyError:
             pass
 
-        del self.db[name_id.text]
+        if text is not None and text != _cn:
+            try:
+                if self.db[text] == _id:
+                    del self.db[text]
+            except KeyError:
+                pass
 
     def remove_local(self, sid):
-        if not isinstance(sid, bytes):
-            sid = sid.encode("utf-8")
-
+        key = self._local_key(sid)
         try:
-            for val in self.db[sid].split(" "):
+            stored = self.db[key]
+        except KeyError:
+            return
+
+        for val in stored.split(" "):
+            if not val:
+                continue
+
+            nid = decode(val)
+            # Remove the complete NameID reverse mapping, but only if it
+            # still points at this local user.
+            try:
+                if self.db[val] in (sid, key):
+                    del self.db[val]
+            except KeyError:
+                pass
+
+            # Remove an old text-only mapping only if it belongs to this
+            # local user.  Another tenant may have a NameID with the same
+            # text.
+            if nid.text is not None and nid.text != val:
                 try:
-                    nid = decode(val)
-                    del self.db[nid.text]
+                    if self.db[nid.text] in (sid, key):
+                        del self.db[nid.text]
                 except KeyError:
                     pass
-            del self.db[sid]
+
+        del self.db[key]
+
+    def _local_key(self, sid):
+        """Return the key actually used for a local user identifier."""
+        try:
+            self.db[sid]
+            return sid
         except KeyError:
             pass
+
+        if isinstance(sid, bytes):
+            candidates = [sid.decode("utf-8")]
+        else:
+            candidates = [sid.encode("utf-8")]
+
+        for candidate in candidates:
+            try:
+                self.db[candidate]
+                return candidate
+            except KeyError:
+                continue
+        return sid
+
+    def _find_forward_owner(self, coded_name_id):
+        """Find the local user whose forward mapping contains a NameID."""
+        for key in self.db.keys():
+            if key == coded_name_id:
+                continue
+            try:
+                stored = self.db[key]
+            except KeyError:
+                continue
+            if not isinstance(stored, str):
+                continue
+            if coded_name_id in stored.split(" "):
+                return key
+        return None
+
+    def _text_alias_matches(self, name_id, ident):
+        """Check that a legacy text-only mapping belongs to this NameID."""
+        try:
+            stored = self.db[ident]
+        except KeyError:
+            # Old databases may only contain the reverse mapping.
+            return True
+
+        if not isinstance(stored, str):
+            return True
+
+        for val in stored.split(" "):
+            if not val:
+                continue
+            candidate = decode(val)
+            if candidate.text != name_id.text:
+                continue
+
+            for attr in ATTR:
+                wanted = getattr(name_id, attr, None)
+                if wanted and getattr(candidate, attr, None) != wanted:
+                    break
+            else:
+                return True
+
+        return False
 
     def get_nameid(self, userid, nformat, sp_name_qualifier, name_qualifier):
         if nformat == NAMEID_FORMAT_PERSISTENT:
@@ -195,6 +337,8 @@ class IdentDB:
             return res
 
         for val in _vals.split(" "):
+            if not val:
+                continue
             nid = decode(val)
             if kwargs:
                 for key, _val in kwargs.items():
@@ -277,12 +421,27 @@ class IdentDB:
         :return:
         """
 
+        # Look up the complete NameID first.  This keeps NameIDs from
+        # different tenants separate even when their text values are equal.
         try:
-            return self.db[name_id.text]
+            return self.db[code(name_id)]
         except KeyError:
-            logger.debug("name: %s", name_id.text)
-            # logger.debug("id sub keys: %s", self.subkeys())
-            return None
+            pass
+
+        # Fall back to the historical text-only mapping so that databases
+        # written by older versions keep working.
+        if name_id.text is not None:
+            try:
+                ident = self.db[name_id.text]
+            except KeyError:
+                pass
+            else:
+                if self._text_alias_matches(name_id, ident):
+                    return ident
+
+        logger.debug("name: %s", name_id.text)
+        # logger.debug("id sub keys: %s", self.subkeys())
+        return None
 
     def match_local_id(self, userid, sp_name_qualifier, name_qualifier):
         try:
