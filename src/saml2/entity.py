@@ -190,6 +190,10 @@ class Entity(HTTPBase):
             self.vorg = None
 
         self.artifact = {}
+        # Maps an artifact to the identity of the requester it has been
+        # bound to (issuer/destination of the first ArtifactResolve), so
+        # that only that requester can ever consume it.
+        self.artifact_binding = {}
         if self.metadata:
             self.sourceid = self.metadata.construct_source_id()
         else:
@@ -1253,8 +1257,38 @@ class Entity(HTTPBase):
     ):
         """
         Create an ArtifactResponse
+
+        The artifact is bound to the requester (issuer and destination) of
+        the first ArtifactResolve that references it. Only that requester
+        may resolve the artifact, and the stored message is consumed only
+        when the ArtifactResponse has been successfully created, so a
+        failed attempt never destroys the message and a delivered message
+        can never be replayed.
+
+        :param request: The ArtifactResolve request
+        :param artifact: The Base64 encoded SAML artifact
         :return:
         """
+
+        try:
+            stored_msg = self.artifact[artifact]
+        except KeyError:
+            raise SAMLError(f"Unknown artifact: {artifact}")
+
+        requester = request.issuer.text if request.issuer is not None else None
+        destination = request.destination
+
+        binding = self.artifact_binding.get(artifact)
+        if binding is None:
+            # First resolution attempt, bind the artifact to this requester
+            self.artifact_binding[artifact] = {
+                "issuer": requester,
+                "destination": destination,
+            }
+        elif binding["issuer"] != requester or binding["destination"] != destination:
+            # Someone else is trying to pick up the message. Refuse, but
+            # leave the message in place for the legitimate requester.
+            raise SAMLError("Artifact is bound to a different requester")
 
         rinfo = self.response_args(request, bindings)
         response = self._status_response(
@@ -1267,8 +1301,13 @@ class Entity(HTTPBase):
             **rinfo,
         )
 
-        msg = element_to_extension_element(self.artifact[artifact])
+        msg = element_to_extension_element(stored_msg)
         response.extension_elements = [msg]
+
+        # The response was successfully created; consume the artifact so
+        # the message can only ever be delivered once.
+        del self.artifact[artifact]
+        self.artifact_binding.pop(artifact, None)
 
         logger.debug("Response: %s", response)
 
@@ -1569,6 +1608,7 @@ class Entity(HTTPBase):
         mhd = message_handle.digest()
         saml_art = create_artifact(self.config.entityid, mhd, endpoint_index)
         self.artifact[saml_art] = message
+        self.artifact_binding.pop(saml_art, None)
         return saml_art
 
     def artifact2destination(self, artifact, descriptor):
