@@ -32,8 +32,11 @@ class Cache:
         self._cache = self._db.collection
         self.debug = debug
 
-    def delete(self, subject_id):
-        self._cache.delete_many({"subject_id": subject_id})
+    def delete(self, subject_id, entity_id=None):
+        query = {"subject_id": subject_id}
+        if entity_id is not None:
+            query["entity_id"] = entity_id
+        self._cache.delete_many(query)
 
     def get_identity(self, subject_id, entities=None, check_not_on_or_after=True):
         """Get all the identity information that has been received and

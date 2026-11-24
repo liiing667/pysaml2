@@ -23,7 +23,28 @@ class Cache:
     def __init__(self, servers, debug=0):
         self._cache = memcache.Client(servers, debug)
 
-    def delete(self, subject_id):
+    def delete(self, subject_id, entity_id=None):
+        if entity_id is not None:
+            if not self._cache.delete(_key(subject_id, entity_id)):
+                raise CacheError("Delete failed")
+
+            entities = self._cache.get(subject_id) or []
+            if entity_id in entities:
+                entities.remove(entity_id)
+                if entities:
+                    if not self._cache.set(subject_id, entities):
+                        raise CacheError("Set operation failed")
+                elif not self._cache.delete(subject_id):
+                    raise CacheError("Delete failed")
+
+            if not entities:
+                subjects = self._cache.get("subjects") or []
+                if subject_id in subjects:
+                    subjects.remove(subject_id)
+                    if not self._cache.set("subjects", subjects):
+                        raise CacheError("Set operation failed")
+            return True
+
         entities = self.entities(subject_id)
         if entities:
             for entity_id in entities:

@@ -37,18 +37,38 @@ class Cache:
             self._db = {}
             self._sync = False
 
-    def delete(self, name_id):
-        """
+    def delete(self, name_id, entity_id=None):
+        """Remove session information for a subject.
 
         :param name_id: The subject identifier, a NameID instance
+        :param entity_id: If given only the information received from this
+            entity is removed, otherwise all information about the subject is
+            removed.
+        :return: True if something was removed, otherwise False
         """
-        del self._db[code(name_id)]
+        cni = code(name_id)
+        if entity_id is None:
+            try:
+                del self._db[cni]
+            except KeyError:
+                return False
+        else:
+            try:
+                del self._db[cni][entity_id]
+            except KeyError:
+                return False
+
+            # Do not leave an empty subject entry behind.
+            if not self._db[cni]:
+                del self._db[cni]
 
         if self._sync:
             try:
                 self._db.sync()
             except AttributeError:
                 pass
+
+        return True
 
     def get_identity(self, name_id, entities=None, check_not_on_or_after=True):
         """Get all the identity information that has been received and

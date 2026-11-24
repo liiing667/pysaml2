@@ -364,11 +364,14 @@ class Saml2Client(Base):
                 self.state[req_id] = {
                     "entity_id": entity_id,
                     "operation": "SLO",
-                    "entity_ids": entity_ids,
+                    "entity_ids": list(entity_ids),
                     "name_id": code(name_id),
                     "reason": reason,
                     "not_on_or_after": expire,
                     "sign": sign,
+                    "session_index": session_index,
+                    "sign_alg": sign_alg,
+                    "digest_alg": digest_alg,
                 }
                 responses[entity_id] = (binding, http_info)
                 not_done.remove(entity_id)
@@ -379,13 +382,17 @@ class Saml2Client(Base):
 
         return responses
 
-    def local_logout(self, name_id):
+    def local_logout(self, name_id, entity_id=None, session_index=None):
         """Remove the user from the cache, equals local logout
 
         :param name_id: The identifier of the subject
+        :param entity_id: Only remove the information received from this
+            entity. If not given all information about the subject is removed.
+        :param session_index: Only remove the information if it still belongs
+            to one of the given session indexes.
+        :return: True if the requested information was removed
         """
-        self.users.remove_person(name_id)
-        return True
+        return self.users.remove_person(name_id, entity_id, session_index)
 
     def is_logged_in(self, name_id):
         """Check if user is in the cache
@@ -404,27 +411,76 @@ class Saml2Client(Base):
         """
 
         logger.debug("state: %s", self.state)
-        status = self.state[response.in_response_to]
+        request_id = response.in_response_to
+        try:
+            status = self.state[request_id]
+        except KeyError:
+            logger.warning("No pending logout request with id %r", request_id)
+            return 0, "400 Bad Request", [], []
+
         logger.debug("status: %s", status)
         issuer = response.issuer()
         logger.debug("issuer: %s", issuer)
-        del self.state[response.in_response_to]
-        if status["entity_ids"] == [issuer]:  # done
-            self.local_logout(decode(status["name_id"]))
-            return 0, "200 Ok", [("Content-type", "text/html")], []
-        else:
-            status["entity_ids"].remove(issuer)
-            if "sign_alg" in status:
-                sign_alg = status["sign_alg"]
-            return self.do_logout(
-                decode(status["name_id"]),
-                status["entity_ids"],
-                status["reason"],
-                status["not_on_or_after"],
-                status["sign"],
-                sign_alg=sign_alg,
-                digest_alg=digest_alg,
+
+        entity_id = status.get("entity_id")
+        entity_ids = list(status.get("entity_ids", []))
+        if entity_id is None:
+            # Backwards compatibility with state created by older versions of
+            # the client.
+            if issuer not in entity_ids:
+                logger.error("Logout response from unexpected issuer %r", issuer)
+                return 0, "400 Bad Request", [], []
+            entity_id = issuer
+        elif issuer != entity_id:
+            logger.error(
+                "Logout response from %r does not match pending request for %r",
+                issuer,
+                entity_id,
             )
+            return 0, "400 Bad Request", [], []
+
+        # Consume the pending request before removing any local session. A
+        # replayed response must not be able to remove a session that has been
+        # established after the original response was handled.
+        try:
+            del self.state[request_id]
+        except KeyError:
+            logger.warning("Logout request with id %r was already handled", request_id)
+            return 0, "400 Bad Request", [], []
+
+        name_id = decode(status["name_id"])
+        self.local_logout(
+            name_id,
+            entity_id=issuer,
+            session_index=status.get("session_index"),
+        )
+
+        # Only continue with entities that still have local session state.
+        # This also makes late responses safe: they cannot restart a logout
+        # that has already completed for the other entities.
+        remaining = [entity for entity in entity_ids if entity != issuer]
+        try:
+            still_present = set(self.users.issuers_of_info(name_id))
+        except KeyError:
+            still_present = set()
+        remaining = [entity for entity in remaining if entity in still_present]
+
+        if not remaining:  # done
+            return 0, "200 Ok", [("Content-type", "text/html")], []
+
+        if status.get("sign_alg") is not None:
+            sign_alg = status["sign_alg"]
+        if status.get("digest_alg") is not None:
+            digest_alg = status["digest_alg"]
+        return self.do_logout(
+            name_id,
+            remaining,
+            status["reason"],
+            status["not_on_or_after"],
+            status["sign"],
+            sign_alg=sign_alg,
+            digest_alg=digest_alg,
+        )
 
     def _use_soap(self, destination, query_type, **kwargs):
         _create_func = getattr(self, f"create_{query_type}")
@@ -683,7 +739,13 @@ class Saml2Client(Base):
 
         if _req.message.name_id == name_id:
             try:
-                if self.local_logout(name_id):
+                # A logout request only terminates the session at the entity
+                # that sent the request, not every session for this subject.
+                if self.local_logout(
+                    name_id,
+                    entity_id=_req.issuer.text,
+                    session_index=_req.message.session_index,
+                ):
                     status = success_status_factory()
                 else:
                     status = status_message_factory("Server error", STATUS_REQUEST_DENIED)
