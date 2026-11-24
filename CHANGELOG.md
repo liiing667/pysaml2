@@ -1,6 +1,21 @@
 # Changelog
 
 
+## Unreleased
+
+- Security: bind an authentication response to the exact authentication
+  transaction it answers.  The response ``InResponseTo`` must reference an
+  outstanding request and, when the IdP entity id was recorded for that
+  request, the assertion issuer must match it, so an ``InResponseTo`` of one
+  transaction can no longer be combined with another IdP's assertion.
+- Security: reject redelivered responses and assertions (replay protection).
+  Consumed response and assertion identifiers are tracked and a second
+  delivery raises ``UnsolicitedResponse``.  A response that fails validation
+  is not marked as consumed, so a legitimate retry keeps working.
+- Add ``Saml2Client.remember_outstanding_authn_request()`` to record an
+  authentication request together with the expected IdP issuer.  Plain
+  string ``outstanding_queries`` values remain fully supported.
+
 ## v7.5.5 (2026-09-17)
 
 - Resolve CVE-2026-26007 by migrating to the from pyOpenSSL to the cryptography APIs

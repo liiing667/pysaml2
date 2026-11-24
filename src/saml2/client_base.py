@@ -159,6 +159,13 @@ class Base(Entity):
         else:
             self.state = state_cache
 
+        # Identifiers of responses/assertions already used to establish a
+        # login.  Keeping them on the client means a redelivery is rejected
+        # even when parsing creates a brand new response object.  Deployments
+        # with several workers may replace these by shared (cached) sets.
+        self.consumed_response_ids = set()
+        self.consumed_assertion_ids = set()
+
         attribute_defaults = {
             "logout_requests_signed": False,
             "logout_responses_signed": False,
@@ -756,6 +763,33 @@ class Base(Entity):
 
     # ======== response handling ===========
 
+    def remember_outstanding_authn_request(self, request_id, came_from, issuer=None, outstanding=None):
+        """Record an authentication request so its response can be tied to
+        this exact authentication transaction.
+
+        :param request_id: The ``AuthnRequest`` ID (the value the response
+            must carry in ``InResponseTo``).
+        :param came_from: The URL the user originally came from.
+        :param issuer: The entity ID of the IdP the request was sent to. When
+            provided the response's assertion issuer is required to match it,
+            which prevents an ``InResponseTo`` from one transaction being
+            combined with an assertion minted for another transaction.
+        :param outstanding: The mapping the application passes later to
+            :meth:`parse_authn_request_response`.  When omitted the mapping
+            kept on this client instance is used (and created on demand).
+        :return: The stored transaction entry.
+        """
+        if outstanding is None:
+            outstanding = getattr(self, "outstanding_queries", None)
+            if outstanding is None:
+                outstanding = self.outstanding_queries = {}
+
+        entry = {"came_from": came_from}
+        if issuer:
+            entry["issuer"] = issuer
+        outstanding[request_id] = entry
+        return entry
+
     def parse_authn_request_response(self, xmlstr, binding, outstanding=None, outstanding_certs=None, conv_info=None):
         """Deal with an AuthnResponse
 
@@ -786,6 +820,8 @@ class Base(Entity):
             "entity_id": self.config.entityid,
             "attribute_converters": self.config.attribute_converters,
             "allow_unknown_attributes": self.config.allow_unknown_attributes,
+            "consumed_response_ids": self.consumed_response_ids,
+            "consumed_assertion_ids": self.consumed_assertion_ids,
             "conv_info": conv_info,
         }
 

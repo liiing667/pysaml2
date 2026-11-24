@@ -609,8 +609,11 @@ class SSO:
             resp = ServiceError(f"Failed to construct the AuthnRequest: {exc}")
             return resp
 
-        # remember the request
-        self.cache.outstanding_queries[_sid] = came_from
+        # remember the request and bind it to the IdP it was sent to.  The
+        # issuer recorded here is checked against the assertion issuer when
+        # the response comes back, so an InResponseTo of one transaction can
+        # never be combined with another IdP's assertion.
+        self.cache.outstanding_queries[_sid] = {"came_from": came_from, "issuer": entity_id}
         return self.response(_binding, ht_args, do_not_start_response=True)
 
     def do(self):
@@ -695,7 +698,8 @@ def disco(environ, start_response, _sp):
     query = parse_qs(environ["QUERY_STRING"])
     entity_id = query["entityID"][0]
     _sid = query["sid"][0]
-    came_from = CACHE.outstanding_queries[_sid]
+    _entry = CACHE.outstanding_queries[_sid]
+    came_from = _entry["came_from"] if isinstance(_entry, dict) else _entry
     _sso = SSO(_sp, environ, start_response, cache=CACHE, **ARGS)
     resp = _sso.redirect_to_auth(_sso.sp, entity_id, came_from)
 

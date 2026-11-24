@@ -996,6 +996,10 @@ allow_unsolicited
 When set to true, the SP will consume unsolicited SAML Responses, i.e. SAML
 Responses for which it has not sent a respective SAML Authentication Request.
 
+Unsolicited responses are still protected against replay: a response or
+assertion that has already been used to establish a login is rejected on
+redelivery even when ``allow_unsolicited`` is enabled.
+
 Example::
 
     "service": {

@@ -58,6 +58,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Replay protection registries.
+#
+# A SAML response (or the assertion it carries) may only be used to establish a
+# login once.  The registries are keyed on the message identifiers so that a
+# redelivery of an already consumed response is rejected even when a fresh
+# ``AuthnResponse`` instance is created to parse it.
+# ---------------------------------------------------------------------------
+_CONSUMED_RESPONSE_IDS = set()
+_CONSUMED_ASSERTION_IDS = set()
+
+
+def reset_consumed_response_ids():
+    """Forget every response previously marked as consumed.
+
+    Mainly useful for testing; production deployments normally keep the
+    registries for the lifetime of the process (or shared state backend).
+    """
+    _CONSUMED_RESPONSE_IDS.clear()
+
+
+def reset_consumed_assertion_ids():
+    """Forget every assertion previously marked as consumed."""
+    _CONSUMED_ASSERTION_IDS.clear()
+
+
+# ---------------------------------------------------------------------------
 
 
 class IncorrectlySigned(SAMLError):
@@ -490,6 +516,8 @@ class AuthnResponse(StatusResponse):
         want_assertions_or_response_signed=False,
         want_response_signed=False,
         conv_info=None,
+        consumed_response_ids=None,
+        consumed_assertion_ids=None,
         **kwargs,
     ):
 
@@ -517,6 +545,16 @@ class AuthnResponse(StatusResponse):
             self.extension_schema = kwargs["extension_schema"]
         except KeyError:
             self.extension_schema = {}
+        # Replay protection.  Default to the module level registries so that
+        # every parsed response shares the same view of what has already been
+        # consumed, while still allowing a deployment to inject its own
+        # (persisted) registries.
+        self.consumed_response_ids = (
+            consumed_response_ids if consumed_response_ids is not None else _CONSUMED_RESPONSE_IDS
+        )
+        self.consumed_assertion_ids = (
+            consumed_assertion_ids if consumed_assertion_ids is not None else _CONSUMED_ASSERTION_IDS
+        )
 
     def check_subject_confirmation_in_response_to(self, irp):
         for assertion in self.response.assertion:
@@ -526,25 +564,125 @@ class AuthnResponse(StatusResponse):
 
         return True
 
+    def _outstanding_entry(self, request_id):
+        """Return the stored information for an outstanding authentication
+        request.
+
+        For backward compatibility the value may either be a plain string
+        (the URL the user originally came from) or a mapping carrying the
+        ``came_from`` URL and optionally the expected IdP ``issuer``.
+        """
+        entry = self.outstanding_queries.get(request_id)
+        if isinstance(entry, dict):
+            return entry
+        return {"came_from": entry}
+
+    def _check_issuer_matches_transaction(self, entry):
+        """Ensure the assertion issuer is the IdP the request was sent to.
+
+        Only enforced when the application recorded an expected issuer for
+        the authentication transaction.  Plain string outstanding entries
+        remain fully backward compatible.
+        """
+        expected_issuer = entry.get("issuer")
+        if expected_issuer and self.issuer() != expected_issuer:
+            raise UnsolicitedResponse(
+                "Response issuer '%s' does not match the issuer '%s' expected for request '%s'"
+                % (self.issuer(), expected_issuer, self.in_response_to)
+            )
+
+    def _check_replay(self):
+        """Reject a response (or its assertions) that has already been used.
+
+        The check is performed against the message identifiers before any
+        state is consumed, so an attacker redelivering a captured response
+        can never reach the point where a session is established.
+        """
+        response_id = getattr(self.response, "id", None)
+        if response_id and response_id in self.consumed_response_ids:
+            raise UnsolicitedResponse(f"Response has already been consumed: {response_id}")
+
+        for assertion in getattr(self.response, "assertion", []) or []:
+            assertion_id = getattr(assertion, "id", None)
+            if assertion_id and assertion_id in self.consumed_assertion_ids:
+                raise UnsolicitedResponse(f"Assertion has already been consumed: {assertion_id}")
+
+    def _mark_consumed(self):
+        """Remember the identifiers of an accepted response.
+
+        Only called once the whole response has been validated, hence a
+        response that fails any check leaves the outstanding request in
+        place so that a legitimate retry still works.
+        """
+        response_id = getattr(self.response, "id", None)
+        if response_id:
+            self.consumed_response_ids.add(response_id)
+
+        for assertion in getattr(self.response, "assertion", []) or []:
+            assertion_id = getattr(assertion, "id", None)
+            if assertion_id:
+                self.consumed_assertion_ids.add(assertion_id)
+
+    def _consume_outstanding_query(self):
+        """Bind the response to the authentication transaction it answers
+        and mark it as consumed.
+
+        The response's ``InResponseTo`` must reference a request the SP
+        actually issued.  When the request recorded which IdP it was sent
+        to, the assertion issuer must match that IdP, which prevents mixing
+        the ``InResponseTo`` of one transaction with an assertion minted for
+        another one.
+
+        This is only invoked once the whole response has been verified, so a
+        response that fails any check leaves both the outstanding request and
+        the replay registries untouched and a legitimate retry keeps working.
+        """
+        entry = self._outstanding_entry(self.in_response_to)
+        self._check_issuer_matches_transaction(entry)
+        self.came_from = entry.get("came_from")
+        # The transaction is now finished; remember the identifiers and
+        # remove the request so a redelivery can neither be matched to a live
+        # request nor pass the replay checks.
+        self._mark_consumed()
+        self.outstanding_queries.pop(self.in_response_to, None)
+
     def loads(self, xmldata, decode=True, origxml=None):
         self._loads(xmldata, decode, origxml)
+        self._post_load_transaction_checks()
+        return self
+
+    def _post_load_transaction_checks(self):
+        """Authentication specific processing after the XML is parsed.
+
+        Ties the response to its authentication transaction (rejecting
+        unknown or issuer mismatched responses) and blocks replays.  Kept in a
+        separate method so it can run exactly once regardless of whether the
+        object was built through :meth:`loads` or the response factory.
+        """
 
         if self.asynchop:
+            self._check_replay()
             if self.in_response_to in self.outstanding_queries:
-                self.came_from = self.outstanding_queries[self.in_response_to]
-                # del self.outstanding_queries[self.in_response_to]
+                # Bind the response to the transaction it answers without
+                # consuming it yet: the issuer check and the subject
+                # confirmation check belong here, while the actual consumption
+                # is deferred to verify() so a failed verification allows a
+                # legitimate retry.
+                entry = self._outstanding_entry(self.in_response_to)
+                self._check_issuer_matches_transaction(entry)
+                self.came_from = entry.get("came_from")
                 try:
                     if not self.check_subject_confirmation_in_response_to(self.in_response_to):
                         raise UnsolicitedResponse(f"Unsolicited response: {self.in_response_to}")
                 except AttributeError:
                     pass
             elif self.allow_unsolicited:
-                # Should check that I haven't seen this before
+                # IdP initiated SSO: there is no matching request.  Replay is
+                # still blocked by _check_replay() above and the accepted
+                # message is marked as consumed in verify().
                 pass
             else:
                 raise UnsolicitedResponse(f"Unsolicited response: {self.in_response_to}")
-
-        return self
 
     def clear(self):
         self._clear()
@@ -697,18 +835,14 @@ class AuthnResponse(StatusResponse):
 
         if self.asynchop and self.came_from is None:
             if data.in_response_to:
-                if data.in_response_to in self.outstanding_queries:
-                    self.came_from = self.outstanding_queries[data.in_response_to]
-                    # del self.outstanding_queries[data.in_response_to]
-                elif self.allow_unsolicited:
-                    pass
-                else:
-                    # This is where I don't allow unsolicited reponses
-                    # Either in_response_to == None or has a value I don't
-                    # recognize
+                # A response referencing a request the SP never issued is
+                # unsolicited and must be rejected unless explicitly allowed.
+                if not self.allow_unsolicited:
                     logger.debug("in response to: '%s'", data.in_response_to)
                     logger.info("outstanding queries: %s", self.outstanding_queries.keys())
-                    raise Exception("Combination of session id and requestURI I don't " "recall")
+                    raise UnsolicitedResponse(
+                        "Combination of session id and requestURI I don't recall: %s" % data.in_response_to
+                    )
         return True
 
     def _holder_of_key_confirmed(self, data):
@@ -1026,6 +1160,17 @@ class AuthnResponse(StatusResponse):
             return self
 
         if self.parse_assertion(keys):
+            # The response is fully valid and is about to establish a login.
+            # Mark it (and the outstanding request) as consumed only now, so
+            # that any earlier failure leaves the request available for a
+            # legitimate retry while a redelivery can never succeed twice.
+            if self.asynchop:
+                if self.in_response_to in self.outstanding_queries:
+                    self._consume_outstanding_query()
+                else:
+                    # IdP initiated (unsolicited) response: no request to
+                    # remove, but still record the identifiers against replay.
+                    self._mark_consumed()
             return self
         else:
             logger.error("Could not parse the assertion")
@@ -1331,6 +1476,11 @@ def response_factory(
                 conv_info=conv_info,
             )
             authnresp.update(response)
+            # ``update`` only copies the already parsed XML; run the
+            # authentication specific processing (without re-parsing or
+            # re-verifying the signature) so transaction binding and replay
+            # protection are enforced on this code path as well.
+            authnresp._post_load_transaction_checks()
             return authnresp
     except TypeError:
         response.signature_check = sec_context.correctly_signed_logout_response
