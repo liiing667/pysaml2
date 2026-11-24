@@ -8,9 +8,11 @@ import importlib
 import logging
 import shelve
 import threading
+import time
 from dbm import error as DbmError
 
 from saml2 import BINDING_HTTP_REDIRECT
+from saml2 import SAMLError
 from saml2 import class_name
 from saml2 import element_to_extension_element
 from saml2 import saml
@@ -35,6 +37,8 @@ from saml2.request import AuthzDecisionQuery
 from saml2.request import NameIDMappingRequest
 from saml2.s_utils import MissingValue
 from saml2.s_utils import Unknown
+from saml2.s_utils import UnknownSystemEntity
+from saml2.s_utils import UnsupportedBinding
 from saml2.s_utils import rndstr
 from saml2.samlp import NameIDMappingResponse
 from saml2.schema import soapenv
@@ -53,6 +57,17 @@ AUTHN_DICT_MAP = {
     "authn_instant": "authn_instant",
     "subject_locality": "subject_locality",
 }
+
+
+class AuthnRequestAdmissionError(SAMLError):
+    """Raised when an AuthnRequest cannot be safely admitted by the IdP."""
+
+    def __init__(self, stage, message, sp_entity_id=None, acs_url=None, request_id=None):
+        super().__init__(message)
+        self.stage = stage
+        self.sp_entity_id = sp_entity_id
+        self.acs_url = acs_url
+        self.request_id = request_id
 
 
 def _shelve_compat(name, *args, **kwargs):
@@ -86,6 +101,10 @@ class Server(Entity):
             self.symkey = saml2.cryptography.symmetric.Default.generate_key()
         self.seed = rndstr()
         self.lock = threading.Lock()
+        # AuthnRequest IDs are single-use.  Entries are kept at least for the
+        # period during which the corresponding request can pass the
+        # IssueInstant check, so a delayed replay is still rejected.
+        self._consumed_authn_request_ids = {}
 
     def getvalid_certificate_str(self):
         if self.sec.cert_handler is not None:
@@ -196,23 +215,102 @@ class Server(Entity):
         """
         return self.metadata.attribute_requirement(sp_entity_id, index)
 
+    @staticmethod
+    def _metadata_endpoint_value(endpoint, name):
+        """Read a value from a metadata endpoint representation.
+
+        Metadata stores endpoints as dictionaries, but callers may pass
+        parsed metadata objects as well.  ``EndpointType`` uses ``text`` for
+        ``Location``.
+        """
+        if isinstance(endpoint, dict):
+            return endpoint.get(name)
+        if name == "location":
+            return getattr(endpoint, "text", None)
+        return getattr(endpoint, name, None)
+
+    def _assertion_consumer_service_endpoints(self, entity_id, binding):
+        """Return the ACS endpoints trusted for *entity_id*.
+
+        An unknown entity or an unsupported binding is an admission failure,
+        not an exception that should escape into unrelated consumers.
+        """
+        try:
+            return self.metadata.assertion_consumer_service(entity_id, binding) or []
+        except (UnknownSystemEntity, UnsupportedBinding):
+            return []
+
     def verify_assertion_consumer_service(self, request):
-        _acs = request.assertion_consumer_service_url
-        _aci = request.assertion_consumer_service_index
-        _binding = request.protocol_binding
-        _eid = request.issuer.text
-        if _acs:
-            # look up acs in for that binding in the metadata given the issuer
-            # Assuming the format is entity
-            for acs in self.metadata.assertion_consumer_service(_eid, _binding):
-                if _acs == acs.text:
-                    return True
-        elif _aci:
-            for acs in self.metadata.assertion_consumer_service(_eid, _binding):
-                if _aci == acs.index:
-                    return True
+        """Verify that the request names a trusted assertion consumer endpoint.
+
+        ``request`` may be either an AuthnRequest wrapper or its protocol
+        message.  If the request carries an AssertionConsumerServiceURL or an
+        AssertionConsumerServiceIndex, it must identify an endpoint published
+        in the SP's metadata for the requested protocol binding.  A request
+        that leaves endpoint selection to the IdP is accepted as long as the
+        SP publishes an endpoint for that binding.
+        """
+        message = getattr(request, "message", request)
+        acs_url = getattr(message, "assertion_consumer_service_url", None)
+        acs_index = getattr(message, "assertion_consumer_service_index", None)
+        binding = getattr(message, "protocol_binding", None)
+        issuer = getattr(getattr(message, "issuer", None), "text", None)
+
+        if not issuer:
+            return False
+        entity_id = issuer.strip()
+
+        endpoints = self._assertion_consumer_service_endpoints(entity_id, binding)
+        if not endpoints:
+            return False
+
+        # With neither selector the IdP is allowed to choose its default ACS;
+        # it still has to be a published endpoint.
+        if acs_url is None and acs_index is None:
+            return True
+
+        for endpoint in endpoints:
+            location = self._metadata_endpoint_value(endpoint, "location")
+            index = self._metadata_endpoint_value(endpoint, "index")
+
+            if acs_url is not None and acs_url != location:
+                continue
+            if acs_index is not None and str(acs_index) != str(index):
+                continue
+            return True
 
         return False
+
+    def _consume_authn_request_id(self, message):
+        """Atomically consume an admitted AuthnRequest ID.
+
+        :return: True the first time the ID is seen, False for a replay.
+        """
+        request_id = getattr(message, "id", None)
+        if not request_id:
+            raise AuthnRequestAdmissionError(
+                "request_id",
+                "AuthnRequest has no request ID",
+                sp_entity_id=getattr(getattr(message, "issuer", None), "text", None),
+            )
+
+        now = time.time()
+        accepted_time_diff = self.config.getattr("accepted_time_diff", "idp") or 0
+        # Request.issue_instant_ok accepts requests one day on either side of
+        # the current time.  Keep the ID at least for that window plus the
+        # configured clock slack.
+        ttl = accepted_time_diff + 2 * 24 * 60 * 60
+
+        with self.lock:
+            expired = [key for key, expires_at in self._consumed_authn_request_ids.items() if expires_at <= now]
+            for key in expired:
+                del self._consumed_authn_request_ids[key]
+
+            if request_id in self._consumed_authn_request_ids:
+                return False
+
+            self._consumed_authn_request_ids[request_id] = now + ttl
+            return True
 
     # -------------------------------------------------------------------------
 
@@ -230,7 +328,7 @@ class Server(Entity):
         :return: A request instance
         """
 
-        return self._parse_request(
+        request = self._parse_request(
             enc_request,
             AuthnRequest,
             "single_sign_on_service",
@@ -239,6 +337,40 @@ class Server(Entity):
             sigalg=sigalg,
             signature=signature,
         )
+
+        if not request:
+            return request
+
+        message = request.message
+        entity_id = getattr(getattr(message, "issuer", None), "text", None)
+        acs_url = getattr(message, "assertion_consumer_service_url", None)
+        acs_index = getattr(message, "assertion_consumer_service_index", None)
+
+        if not self.verify_assertion_consumer_service(message):
+            endpoint = acs_url if acs_url is not None else acs_index
+            raise AuthnRequestAdmissionError(
+                "acs",
+                "AuthnRequest rejected: assertion consumer endpoint "
+                f"{endpoint!r} is not registered for SP {entity_id!r}",
+                sp_entity_id=entity_id,
+                acs_url=acs_url,
+                request_id=getattr(message, "id", None),
+            )
+
+        # Consume the ID only after the request has passed signature and
+        # metadata validation.  A rejected request must not burn the ID.
+        if not self._consume_authn_request_id(message):
+            raise AuthnRequestAdmissionError(
+                "replay",
+                "AuthnRequest rejected: request ID "
+                f"{getattr(message, 'id', None)!r} has already been consumed "
+                f"for SP {entity_id!r}",
+                sp_entity_id=entity_id,
+                acs_url=acs_url,
+                request_id=getattr(message, "id", None),
+            )
+
+        return request
 
     def parse_attribute_query(self, xml_string, binding):
         """Parse an attribute query
